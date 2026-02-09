@@ -1,0 +1,50 @@
+# =========================
+# Python
+# =========================
+__pycache__/
+*.py[cod]
+
+# =========================
+# Checkpoints / outputs
+# =========================
+*.pth
+*.pt
+vis/
+checkpoints/
+*.tar.gz
+
+# =========================
+# Data: 기본은 다 무시
+# =========================
+data/**
+
+# 그런데 코드/설정/문서는 다시 포함
+!data/**/*.py
+!data/**/*.md
+!data/**/*.txt
+!data/**/*.json
+
+# (선택) 스크립트/셸도 올리고 싶으면
+!data/**/*.sh
+
+# =========================
+# MNIST 같은 자동다운로드 raw는 확실히 제외
+# =========================
+pytorch_practice/data/MNIST/raw/
+pytorch_practice/data/**/raw/
+pytorch_practice/data/**/train*/   # 원하시면 조절
+pytorch_practice/data/**/val*/     # 원하시면 조절
+
+# =========================
+# COCO/Imagenet 이미지/라벨 폴더는 확실히 제외
+# (지금 폴더 구조에 맞춰서)
+# =========================
+pytorch_practice/data/coco/images/
+pytorch_practice/data/coco/annotations/
+pytorch_practice/data/coco/masks/
+
+# ImageNet real datasets (images)
+pytorch_practice/data/imagenet/data/raw/
+pytorch_practice/data/imagenet/data/split/
+
+
