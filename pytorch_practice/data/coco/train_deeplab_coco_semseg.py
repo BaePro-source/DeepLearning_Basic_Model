@@ -227,34 +227,194 @@ class COCOSemSeg(Dataset):
 
         return image, mask
 
+class DiceLoss(nn.Module):
+    def __init__(self, num_classes: int, smooth: float = 1.0, ignore_index=None, exclude_bg: bool = False):
+        super().__init__()
+        self.num_classes = num_classes
+        self.smooth = smooth
+        self.ignore_index = ignore_index
+        self.exclude_bg = exclude_bg
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        logits: [B,C,H,W] (raw logits)
+        target: [B,H,W]   (int64 class id)
+        """
+        B, C, H, W = logits.shape
+        probs = F.softmax(logits, dim=1)  # [B,C,H,W]
+
+        # ignore_index 처리
+        if self.ignore_index is not None:
+            mask = (target != self.ignore_index)  # [B,H,W]
+        else:
+            mask = torch.ones_like(target, dtype=torch.bool)
+
+        # target one-hot
+        target_clamped = target.clone()
+        target_clamped[~mask] = 0  # dummy
+        onehot = F.one_hot(target_clamped, num_classes=C).permute(0, 3, 1, 2).float()  # [B,C,H,W]
+        onehot = onehot * mask.unsqueeze(1).float()
+        probs = probs * mask.unsqueeze(1).float()
+
+        # 배경 제외 옵션
+        start_c = 1 if self.exclude_bg else 0
+        probs = probs[:, start_c:]
+        onehot = onehot[:, start_c:]
+
+        # dice per class, then mean
+        dims = (0, 2, 3)
+        intersection = (probs * onehot).sum(dims)
+        union = probs.sum(dims) + onehot.sum(dims)
+
+        dice = (2 * intersection + self.smooth) / (union + self.smooth)
+        loss = 1.0 - dice.mean()
+        return loss
+
+class FocalLoss(nn.Module):
+    def __init__(self, gamma: float = 2.0, alpha=None, reduction: str = "mean"):
+        super().__init__()
+        self.gamma = gamma
+        self.alpha = alpha  # None or scalar or Tensor[C]
+        self.reduction = reduction
+
+    def forward(self, logits: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+        """
+        logits: [B,C,H,W]
+        target: [B,H,W] (int64)
+        """
+        log_probs = F.log_softmax(logits, dim=1)  # [B,C,H,W]
+        probs = torch.exp(log_probs)
+
+        # target class의 확률/로그확률만 픽셀별로 선택 -> [B,H,W]
+        log_pt = log_probs.gather(1, target.unsqueeze(1)).squeeze(1)
+        pt = probs.gather(1, target.unsqueeze(1)).squeeze(1)
+
+        loss = -((1 - pt) ** self.gamma) * log_pt  # [B,H,W]
+
+        # ✅ alpha 적용 (클래스별 가중치면 픽셀별로 gather 해야 함)
+        if self.alpha is not None:
+            if isinstance(self.alpha, torch.Tensor):
+                # alpha: [C] → target로 인덱싱해서 [B,H,W]
+                alpha_t = self.alpha.to(target.device)[target]
+                loss = alpha_t * loss
+            else:
+                # scalar
+                loss = self.alpha * loss
+
+        if self.reduction == "mean":
+            return loss.mean()
+        elif self.reduction == "sum":
+            return loss.sum()
+        return loss
+
+
+@torch.no_grad()
+def _update_confmat(confmat, pred, target, num_classes, ignore_index=None):
+    pred = pred.view(-1).to(torch.int64)
+    target = target.view(-1).to(torch.int64)
+
+    if ignore_index is not None:
+        mask = (target != ignore_index)
+        pred = pred[mask]
+        target = target[mask]
+
+    valid = (target >= 0) & (target < num_classes) & (pred >= 0) & (pred < num_classes)
+    pred = pred[valid]
+    target = target[valid]
+
+    idx = target * num_classes + pred
+    confmat += torch.bincount(idx, minlength=num_classes * num_classes).cpu().view(num_classes, num_classes)
+
+def _miou_from_confmat(confmat: torch.Tensor):
+    # confmat: [C,C] on CPU (int64/float OK)
+    confmat = confmat.to(torch.float64)
+
+    tp = torch.diag(confmat)
+    fp = confmat.sum(0) - tp
+    fn = confmat.sum(1) - tp
+    denom = tp + fp + fn
+
+    iou = tp / torch.clamp(denom, min=1.0)  # [C]
+    miou_all = iou.mean().item()
+
+    present = denom > 0
+    miou_present = iou[present].mean().item() if present.any() else 0.0
+
+    return miou_all, miou_present, iou
 
 # -------------------------
 # 3) Train / Eval
 # -------------------------
+
+def compute_class_weights(loader, num_classes, device):
+    counts = torch.zeros(num_classes, dtype=torch.long)
+    for _, y in loader:
+        y = y.view(-1)
+        for c in y.unique():
+            counts[c] += (y == c).sum()
+    freq = counts.float() / counts.sum().clamp(min=1)
+    weights = 1.0 / torch.log(1.02 + freq)   # 흔히 쓰는 방식
+    return weights.to(device)
+
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, device, num_classes: int, ignore_index=None, print_topk: int = 0):
     model.eval()
-    total = 0
-    correct = 0
-    for x, y in loader:
-        x = x.to(device)
-        y = y.to(device)
-        logits = model(x)                 # [B,C,H,W]
-        pred = logits.argmax(dim=1)       # [B,H,W]
-        correct += (pred == y).sum().item()
-        total += y.numel()
-    return correct / max(total, 1)
+    confmat = torch.zeros((num_classes, num_classes), dtype=torch.int64)
 
-
-def train_one_epoch(model, loader, opt, criterion, device):
-    model.train()
-    total_loss = 0.0
     for x, y in loader:
         x = x.to(device)
         y = y.to(device)
 
         logits = model(x)
-        loss = criterion(logits, y)
+        pred = logits.argmax(dim=1)
+
+        # confmat 업데이트 (여기 _update_confmat는 이미 쓰고 계신 버전 그대로 사용)
+        _update_confmat(confmat, pred.detach().cpu(), y.detach().cpu(), num_classes, ignore_index)
+
+    # acc
+    correct = torch.diag(confmat).sum().item()
+    total = confmat.sum().item()
+    acc = correct / max(total, 1)
+
+    # miou
+    miou_all, miou_present, iou = _miou_from_confmat(confmat)
+
+    # 클래스별 IoU 상/하위 출력
+    if print_topk and print_topk > 0:
+        iou_np = iou.cpu()
+        denom = (torch.diag(confmat) + (confmat.sum(0)-torch.diag(confmat)) + (confmat.sum(1)-torch.diag(confmat))).cpu()
+        present = denom > 0
+
+        # present인 클래스만 대상으로 정렬
+        idx_present = torch.where(present)[0]
+        iou_present_vec = iou_np[idx_present]
+
+        k = min(print_topk, len(idx_present))
+        if k > 0:
+            # 상위
+            topv, topi = torch.topk(iou_present_vec, k=k, largest=True)
+            top_cls = idx_present[topi]
+            # 하위
+            lowv, lowi = torch.topk(iou_present_vec, k=k, largest=False)
+            low_cls = idx_present[lowi]
+
+            print(f"[IoU TOP {k}] " + ", ".join([f"{int(c)}:{float(v)*100:.2f}%" for c, v in zip(top_cls, topv)]))
+            print(f"[IoU LOW {k}] " + ", ".join([f"{int(c)}:{float(v)*100:.2f}%" for c, v in zip(low_cls, lowv)]))
+
+    return acc, miou_all, miou_present
+
+
+def train_one_epoch(model, loader, opt, focal_loss, dice_loss, dice_weight, device):
+    model.train()
+    total_loss = 0.0
+
+    for x, y in loader:
+        x = x.to(device)
+        y = y.to(device)
+
+        logits = model(x)  # [B,C,H,W]
+
+        loss = focal_loss(logits, y) + dice_weight * dice_loss(logits, y)
 
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -339,8 +499,8 @@ def main():
     batch_size = 2
     num_workers = 2
     lr = 1e-4
-    epochs = 50
-    output_stride = 16
+    epochs = 100
+    output_stride = 8
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print("device:", device)
@@ -367,7 +527,20 @@ def main():
 
     model = DeepLabV3Plus(num_classes=num_classes, pretrained=True, output_stride=output_stride).to(device)
 
-    criterion = nn.CrossEntropyLoss()  # softmax 포함이라 logits 그대로 넣음
+    class_weights = compute_class_weights(
+        train_loader,
+        num_classes=num_classes,
+        device=device
+    )
+
+    criterion = nn.CrossEntropyLoss(
+        weight=class_weights
+    )
+
+    focal_loss = FocalLoss(gamma=2.0, alpha = class_weights)
+    dice_loss = DiceLoss(num_classes=num_classes, ignore_index=None, exclude_bg=False)
+
+    dice_weight = 0.3  # 0.5~1.0 추천 (처음은 1.0)
     opt = torch.optim.AdamW(model.parameters(), lr=lr)
 
     save_predictions(model, val_loader, device, num_classes, out_dir="vis/before", max_images=4)
@@ -379,21 +552,41 @@ def main():
         out0 = model(x0.to(device))
     print("out:", out0.shape, "pred:", out0.argmax(1).shape)
 
-    best_val_acc = 0.0
+    # ✅ best 기준도 val_acc 말고 val_mIoU(present)로 저장 추천
+    best_val_miou_present = -1.0
 
     for ep in range(1, epochs + 1):
-        loss = train_one_epoch(model, train_loader, opt, criterion, device)
+        loss = train_one_epoch(
+            model, train_loader, opt,
+            focal_loss, dice_loss, dice_weight,
+            device
+        )
 
-        train_acc = evaluate(model, train_loader, device)
-        val_acc   = evaluate(model, val_loader, device)
+        train_acc, train_miou_all, train_miou_present = evaluate(
+            model, train_loader, device, num_classes=num_classes, ignore_index=None
+        )
+
+        val_acc, val_miou_all, val_miou_present = evaluate(
+            model, val_loader, device, num_classes=num_classes, ignore_index=None,
+            print_topk=10 if (ep % 10 == 0) else 0
+        )
+
 
         print(f"[Epoch {ep}] loss={loss:.4f}")
-        print(f"train-acc={train_acc*100:.2f}%  val-acc={val_acc*100:.2f}%")
+        print(
+            f"train-acc={train_acc*100:.2f}%  "
+            f"train-mIoU(all)={train_miou_all*100:.2f}%  "
+            f"train-mIoU(present)={train_miou_present*100:.2f}%"
+        )
 
-
-        if val_acc > best_val_acc:
-            best_val_acc = val_acc
+        if val_miou_present > best_val_miou_present :
+            best_val_miou_present = val_miou_present
+            print(
+                f"[BEST] ep={ep} "
+                f"val-mIoU(present)={val_miou_present*100:.2f}%"
+            )
             torch.save(model.state_dict(), "best.pth")
+
 
     # 저장
     ckpt = Path("deeplabv3plus_coco_semseg.pth")
