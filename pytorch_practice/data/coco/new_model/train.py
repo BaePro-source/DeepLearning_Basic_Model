@@ -35,7 +35,7 @@ def main():
     OUTPUT_STRIDE = 16  # 8 or 16
     
     # Data subset sizes (increase for full training)
-    N_TRAIN = 5000
+    N_TRAIN = 10000
     N_VAL = 1000
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -146,6 +146,11 @@ def main():
             torch.save(model.state_dict(), "best_model.pth")
             print(f"  [BEST MODEL SAVED] val-mIoU(present)={val_miou_present*100:.2f}%")
         
+            save_predictions(
+                model, val_loader, device, NUM_CLASSES,
+                out_dir="vis/best", max_images=4
+            )
+        
         print()
 
     # ===== Final Results =====
@@ -173,3 +178,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    
