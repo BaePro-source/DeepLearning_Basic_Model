@@ -14,7 +14,53 @@ from utils import (
     train_one_epoch,
     save_predictions
 )
+import matplotlib.pyplot as plt
 
+@torch.no_grad()
+def compute_loss(model, loader, criterion, device):
+    model.eval()
+    total_loss = 0.0
+    total = 0
+
+    for x, y in loader:
+        x = x.to(device, non_blocking=True)
+        y = y.to(device, non_blocking=True)
+
+        logits = model(x)
+        loss = criterion(logits, y)
+
+        bs = x.size(0)
+        total_loss += loss.item() * bs
+        total += bs
+
+    return total_loss / max(total, 1)
+
+def plot_training_curves(history, model_name="DeepLabV3Plus"):
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    # Loss curve
+    plt.figure()
+    plt.plot(epochs, history["train_loss"])
+    plt.plot(epochs, history["val_loss"])
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"{model_name} - Loss Curve")
+    plt.legend(["Train", "Validation"])
+    plt.grid(True)
+    plt.savefig(f"{model_name}_loss_curve.png", dpi=300)
+    plt.close()
+
+    # Accuracy curve
+    plt.figure()
+    plt.plot(epochs, history["train_acc"])
+    plt.plot(epochs, history["val_acc"])
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title(f"{model_name} - Accuracy Curve")
+    plt.legend(["Train", "Validation"])
+    plt.grid(True)
+    plt.savefig(f"{model_name}_acc_curve.png", dpi=300)
+    plt.close()
 
 def main():
     # ===== Configuration =====
@@ -114,7 +160,9 @@ def main():
 
     for epoch in range(1, EPOCHS + 1):
         # Train
-        loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+        trian_loss = train_one_epoch(model, train_loader, optimizer, criterion, device)
+
+        val_loss = compute_loss(model, val_loader, criterion, device)
 
         # Evaluate on train set
         train_acc, train_miou_all, train_miou_present = evaluate(
@@ -126,6 +174,11 @@ def main():
             model, val_loader, device, num_classes=NUM_CLASSES,
             print_topk=10 if (epoch % 10 == 0) else 0
         )
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
 
         # Print results
         print(f"[Epoch {epoch}/{EPOCHS}] loss={loss:.4f}")
@@ -139,6 +192,14 @@ def main():
             f"mIoU(all)={val_miou_all*100:.2f}%  "
             f"mIoU(present)={val_miou_present*100:.2f}%"
         )
+
+        history = {
+            "train_loss": [],
+            "val_loss": [],
+            "train_acc": [],
+            "val_acc": []
+        }
+
 
         # Save best model
         if val_miou_present > best_val_miou:
@@ -174,6 +235,9 @@ def main():
     print("\nModels saved:")
     print("  - best_model.pth (best validation mIoU)")
     print("  - final_model.pth (last epoch)")
+
+    plot_training_curves(history, "DeepLabV3Plus")
+
 
 
 if __name__ == "__main__":
