@@ -91,12 +91,6 @@ def main():
         T.Normalize((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
     ])
 
-    # -------------------------
-    # Path (CWD 상관없이 고정)
-    # 현재 파일: data/imagenet/scripts/train_imagenet.py
-    # 데이터:     data/imagenet/data/split/{train,val}
-    # -------------------------
-
     train_dir = data_dir / "split" / "train"
     val_dir = data_dir / "split" / "val"
 
@@ -133,7 +127,7 @@ def main():
         train_ds,
         batch_size=32,
         shuffle=True,
-        num_workers=2,   # 윈도우는 0이 가장 안전
+        num_workers=2,   
         pin_memory=True,
     )
     val_loader = DataLoader(
