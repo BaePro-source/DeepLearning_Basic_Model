@@ -1,6 +1,7 @@
 import os
 import sys
 from pathlib import Path
+import matplotlib.pyplot as plt
 
 script_dir = Path(__file__).resolve().parent            # .../data/imagenet/scripts
 imagenet_root = script_dir.parent                       # .../data/imagenet
@@ -50,8 +51,9 @@ def train_one_epoch(model, loader, criterion, optimizer, device, scaler) :
     return total_loss / max(total, 1), correct / max(total, 1)
 
 @torch.no_grad()
-def evaluate(model, loader, device):
+def evaluate(model, loader, criterion, device):
     model.eval()
+    train_loss = 0.0
     correct = 0
     total = 0
 
@@ -61,12 +63,41 @@ def evaluate(model, loader, device):
 
         with torch.cuda.amp.autocast():
             logits = model(x)
+            loss = criterion(logits, y)
 
+        total_loss += loss.item() * x.size(0) 
         pred = logits.argmax(dim=1)
         correct += (pred == y).sum().item()
         total += y.size(0)
 
-    return correct / max(total, 1)
+    return total_loss / max(total, 1), correct / max(total, 1)
+
+
+def plot_training_curves(history, model_name):
+    epochs = range(1, len(history["train_loss"]) + 1)
+
+    # Loss
+    plt.figure()
+    plt.plot(epochs, history["train_loss"])
+    plt.plot(epochs, history["val_loss"])
+    plt.xlabel("Epoch")
+    plt.ylabel("Loss")
+    plt.title(f"{model_name} - Loss Curve")
+    plt.legend(["Train", "Validation"])
+    plt.grid(True)
+    plt.savefig(f"{model_name}_loss_curve.png", dpi=300)
+    plt.close()
+
+    plt.figure()
+    plt.plot(epochs, history["train_acc"])
+    plt.plot(epochs, history["val_acc"])
+    plt.xlabel("Epoch")
+    plt.ylabel("Accuracy")
+    plt.title(f"{model_name} - Accuracy Curve")
+    plt.legend(["Train", "Validation"])
+    plt.grid(True)
+    plt.savefig(f"{model_name}_acc_curve.png", dpi=300)
+    plt.close()
 
 
 def main():
@@ -75,9 +106,13 @@ def main():
     if torch.cuda.is_available():
         print("GPU:", torch.cuda.get_device_name(0))
 
-    # -------------------------
-    # Transform
-    # -------------------------
+    history = {
+        "train_loss" : [],
+        "val_loss" : [],
+        "train_acc" : [],
+        "val_acc" : []
+    }
+
     train_tf = T.Compose([
         T.RandomResizedCrop(224),
         T.RandomHorizontalFlip(),
@@ -157,15 +192,31 @@ def main():
     optimizer = optim.SGD(model.parameters(), lr=0.01, momentum=0.9)
     scaler = torch.cuda.amp.GradScaler()
 
-    start_epoch = 10
+    start_epoch = 1
     epochs = 20
     for epoch in range(start_epoch, epochs + 1):
-        train_loss, train_acc = train_one_epoch(model, train_loader, criterion, optimizer, device, scaler)
-        val_acc = evaluate(model, val_loader, device)
-        print(f"[Epoch {epoch}] loss={train_loss:.4f} train_acc={train_acc*100:.2f}% val_acc={val_acc*100:.2f}%")
-        ckpt_path = imagenet_root / "checkpoints" / f"vgg16_epoch{epoch}.pth"
-        torch.save(model.state_dict(), str(ckpt_path))
-        print(f"[checkpoint saved] {ckpt_path}")
+        train_loss, train_acc = train_one_epoch(
+            model, train_loader, criterion, optimizer, device, scaler
+        )
+
+        val_loss, val_acc = evaluate(
+            model, val_loader, criterion, device
+        )
+
+        history["train_loss"].append(train_loss)
+        history["val_loss"].append(val_loss)
+        history["train_acc"].append(train_acc)
+        history["val_acc"].append(val_acc)
+
+        print(
+            f"[Epoch {epoch}] "
+            f"loss={train_loss:.4f} "
+            f"val_loss={val_loss:.4f} "
+            f"train_acc={train_acc*100:.2f}% "
+            f"val_acc={val_acc*100:.2f}%"
+        )
+
+    plot_training_curves(history, "VGG16", start_epoch)
 
 
 if __name__ == "__main__":
